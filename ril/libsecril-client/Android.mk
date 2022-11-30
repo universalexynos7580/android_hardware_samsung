@@ -6,6 +6,9 @@ include $(CLEAR_VARS)
 LOCAL_SRC_FILES:= \
     secril-client.cpp
 
+LOCAL_C_INCLUDES += \
+	hardware/ril/include
+
 LOCAL_SHARED_LIBRARIES := \
     libutils \
     libbinder \
@@ -13,7 +16,7 @@ LOCAL_SHARED_LIBRARIES := \
     libhardware_legacy \
     liblog
 
-LOCAL_CFLAGS := 
+LOCAL_CFLAGS :=
 
 ifeq ($(TARGET_BOARD_PLATFORM),exynos4)
 LOCAL_CFLAGS += -DRIL_CALL_AUDIO_PATH_EXTRAVOLUME
@@ -27,6 +30,7 @@ LOCAL_CFLAGS += -DUSES_VND_SECRIL
 endif
 
 LOCAL_MODULE:= libsecril-client
+LOCAL_VENDOR_MODULE := true
 LOCAL_PRELINK_MODULE := false
 
 include $(BUILD_SHARED_LIBRARY)
