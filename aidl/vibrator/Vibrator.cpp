@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021 The LineageOS Project
+ * Copyright (C) 2021-2023 The LineageOS Project
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -7,6 +7,7 @@
 #include "Vibrator.h"
 
 #include <android-base/logging.h>
+#include <android-base/properties.h>
 
 #include <cmath>
 #include <fstream>
@@ -19,6 +20,9 @@ namespace android {
 namespace hardware {
 namespace vibrator {
 
+const std::string kVibratorPropPrefix = "ro.vendor.vibrator_hal.";
+const std::string kVibratorPropDuration = "_duration";
+
 static std::map<Effect, int> CP_TRIGGER_EFFECTS {
     { Effect::CLICK, 10 },
     { Effect::DOUBLE_CLICK, 14 },
@@ -26,6 +30,14 @@ static std::map<Effect, int> CP_TRIGGER_EFFECTS {
     { Effect::TEXTURE_TICK, 50 },
     { Effect::TICK, 50 }
 };
+
+#ifdef VIBRATOR_SUPPORTS_DURATION_AMPLITUDE_CONTROL
+static std::map<EffectStrength, float> DURATION_AMPLITUDE = {
+    { EffectStrength::LIGHT, DURATION_AMPLITUDE_LIGHT },
+    { EffectStrength::MEDIUM, DURATION_AMPLITUDE_MEDIUM },
+    { EffectStrength::STRONG, DURATION_AMPLITUDE_STRONG }
+};
+#endif
 
 /*
  * Write value to path and close file.
@@ -54,6 +66,10 @@ static bool nodeExists(const std::string& path) {
     return f.good();
 }
 
+static int getIntProperty(const std::string& key, int def) {
+    return ::android::base::GetIntProperty(kVibratorPropPrefix + key, def);
+}
+
 Vibrator::Vibrator() {
     mIsTimedOutVibrator = nodeExists(VIBRATOR_TIMEOUT_PATH);
     mHasTimedOutIntensity = nodeExists(VIBRATOR_INTENSITY_PATH);
@@ -65,10 +81,12 @@ ndk::ScopedAStatus Vibrator::getCapabilities(int32_t* _aidl_return) {
                     IVibrator::CAP_EXTERNAL_CONTROL /*| IVibrator::CAP_COMPOSE_EFFECTS |
                     IVibrator::CAP_ALWAYS_ON_CONTROL*/;
 
-    if (mHasTimedOutIntensity) {
-        *_aidl_return = *_aidl_return | IVibrator::CAP_AMPLITUDE_CONTROL |
-                        IVibrator::CAP_EXTERNAL_AMPLITUDE_CONTROL;
-    }
+#ifdef VIBRATOR_SUPPORTS_DURATION_AMPLITUDE_CONTROL
+    *_aidl_return |= IVibrator::CAP_AMPLITUDE_CONTROL | IVibrator::CAP_EXTERNAL_AMPLITUDE_CONTROL;
+#else
+    if (mHasTimedOutIntensity)
+        *_aidl_return |= IVibrator::CAP_AMPLITUDE_CONTROL | IVibrator::CAP_EXTERNAL_AMPLITUDE_CONTROL;
+#endif
 
     return ndk::ScopedAStatus::ok();
 }
@@ -82,6 +100,10 @@ ndk::ScopedAStatus Vibrator::on(int32_t timeoutMs, const std::shared_ptr<IVibrat
 
     if (mHasTimedOutEffect)
         writeNode(VIBRATOR_CP_TRIGGER_PATH, 0); // Clear all effects
+
+#ifdef VIBRATOR_SUPPORTS_DURATION_AMPLITUDE_CONTROL
+    timeoutMs *= mDurationAmplitude;
+#endif
 
     status = activate(timeoutMs);
 
@@ -101,7 +123,7 @@ ndk::ScopedAStatus Vibrator::on(int32_t timeoutMs, const std::shared_ptr<IVibrat
 
 ndk::ScopedAStatus Vibrator::perform(Effect effect, EffectStrength strength, const std::shared_ptr<IVibratorCallback>& callback, int32_t* _aidl_return) {
     ndk::ScopedAStatus status;
-    uint32_t amplitude = strengthToAmplitude(strength, &status);
+    float amplitude = strengthToAmplitude(strength, &status);
     uint32_t ms = 1000;
 
     if (!status.isOk())
@@ -122,6 +144,10 @@ ndk::ScopedAStatus Vibrator::perform(Effect effect, EffectStrength strength, con
             return status;
     }
 
+#ifdef VIBRATOR_SUPPORTS_DURATION_AMPLITUDE_CONTROL
+    ms *= DURATION_AMPLITUDE[strength];
+#endif
+
     status = activate(ms);
 
     if (callback != nullptr) {
@@ -138,40 +164,38 @@ ndk::ScopedAStatus Vibrator::perform(Effect effect, EffectStrength strength, con
 }
 
 ndk::ScopedAStatus Vibrator::getSupportedEffects(std::vector<Effect>* _aidl_return) {
-    *_aidl_return = {Effect::CLICK, Effect::DOUBLE_CLICK, Effect::HEAVY_CLICK,
-                     Effect::TICK, Effect::TEXTURE_TICK, Effect::THUD, Effect::POP,
-                     Effect::RINGTONE_1, Effect::RINGTONE_2, Effect::RINGTONE_3,
-                     Effect::RINGTONE_4, Effect::RINGTONE_5, Effect::RINGTONE_6,
-                     Effect::RINGTONE_7, Effect::RINGTONE_7, Effect::RINGTONE_8,
-                     Effect::RINGTONE_9, Effect::RINGTONE_10, Effect::RINGTONE_11,
-                     Effect::RINGTONE_12, Effect::RINGTONE_13, Effect::RINGTONE_14,
-                     Effect::RINGTONE_15};
+    *_aidl_return = { Effect::CLICK, Effect::TICK, Effect::TEXTURE_TICK };
+
+    if (mHasTimedOutEffect) {
+      for (const auto& effect : CP_TRIGGER_EFFECTS) {
+          _aidl_return->push_back(effect.first);
+      }
+    }
     return ndk::ScopedAStatus::ok();
 }
 
 ndk::ScopedAStatus Vibrator::setAmplitude(float amplitude) {
     uint32_t intensity;
 
-    if (amplitude == 0) {
-        return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_ARGUMENT);
+    if (amplitude <= 0.0f || amplitude > 1.0f) {
+        return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_ILLEGAL_ARGUMENT));
     }
 
-    LOG(DEBUG) << "Setting amplitude: " << (uint32_t)amplitude;
+#ifdef VIBRATOR_SUPPORTS_DURATION_AMPLITUDE_CONTROL
+    mDurationAmplitude = durationAmplitude(amplitude);
+#endif
 
-    intensity = std::lround((amplitude - 1) * INTENSITY_MAX / 254.0);
-    if (intensity > INTENSITY_MAX) {
-        intensity = INTENSITY_MAX;
-    }
+    LOG(DEBUG) << "Setting amplitude: " << amplitude;
 
-    if (intensity == 0) {
-        return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_ARGUMENT);
-    }
+    intensity = amplitude * INTENSITY_MAX;
 
+#ifndef VIBRATOR_SUPPORTS_DURATION_AMPLITUDE_CONTROL
     LOG(DEBUG) << "Setting intensity: " << intensity;
 
     if (mHasTimedOutIntensity) {
         return writeNode(VIBRATOR_INTENSITY_PATH, intensity);
     }
+#endif
 
     return ndk::ScopedAStatus::ok();
 }
@@ -265,16 +289,16 @@ ndk::ScopedAStatus Vibrator::activate(uint32_t timeoutMs) {
     return writeNode(VIBRATOR_TIMEOUT_PATH, timeoutMs);
 }
 
-uint8_t Vibrator::strengthToAmplitude(EffectStrength strength, ndk::ScopedAStatus* status) {
+float Vibrator::strengthToAmplitude(EffectStrength strength, ndk::ScopedAStatus* status) {
     *status = ndk::ScopedAStatus::ok();
 
     switch (strength) {
         case EffectStrength::LIGHT:
-            return 64;
+            return AMPLITUDE_LIGHT;
         case EffectStrength::MEDIUM:
-            return 128;
+            return AMPLITUDE_MEDIUM;
         case EffectStrength::STRONG:
-            return 255;
+            return AMPLITUDE_STRONG;
     }
 
     *status = ndk::ScopedAStatus::fromExceptionCode(EX_UNSUPPORTED_OPERATION);
@@ -285,36 +309,29 @@ uint32_t Vibrator::effectToMs(Effect effect, ndk::ScopedAStatus* status) {
     *status = ndk::ScopedAStatus::ok();
     switch (effect) {
         case Effect::CLICK:
-            return 10;
-        case Effect::DOUBLE_CLICK:
-            return 15;
+            return getIntProperty("click" + kVibratorPropDuration, 10);
         case Effect::TICK:
+            return getIntProperty("tick" + kVibratorPropDuration, 5);
         case Effect::TEXTURE_TICK:
-        case Effect::THUD:
-        case Effect::POP:
-            return 5;
-        case Effect::HEAVY_CLICK:
-            return 10;
-        case Effect::RINGTONE_1:
-        case Effect::RINGTONE_2:
-        case Effect::RINGTONE_3:
-        case Effect::RINGTONE_4:
-        case Effect::RINGTONE_5:
-        case Effect::RINGTONE_6:
-        case Effect::RINGTONE_7:
-        case Effect::RINGTONE_8:
-        case Effect::RINGTONE_9:
-        case Effect::RINGTONE_10:
-        case Effect::RINGTONE_11:
-        case Effect::RINGTONE_12:
-        case Effect::RINGTONE_13:
-        case Effect::RINGTONE_14:
-        case Effect::RINGTONE_15:
-            return 30000;
+            return getIntProperty("texture_tick" + kVibratorPropDuration, 5);
+        default:
+            break;
     }
     *status = ndk::ScopedAStatus::fromExceptionCode(EX_UNSUPPORTED_OPERATION);
     return 0;
 }
+
+#ifdef VIBRATOR_SUPPORTS_DURATION_AMPLITUDE_CONTROL
+float Vibrator::durationAmplitude(float amplitude) {
+    if (amplitude == 1) {
+        return DURATION_AMPLITUDE_STRONG;
+    } else if (amplitude >= 0.5) {
+        return DURATION_AMPLITUDE_MEDIUM;
+    }
+
+    return DURATION_AMPLITUDE_LIGHT;
+}
+#endif
 
 } // namespace vibrator
 } // namespace hardware
